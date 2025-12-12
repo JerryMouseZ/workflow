@@ -1,0 +1,73 @@
+# 可直接复制为 workflow/config.toml 并按需修改
+
+[workflow]
+rounds = 1
+log_dir = "workflow/logs"
+state_file = "workflow/state.json"
+
+[[steps]]
+type = "profile_analyze"
+name = "profile"
+analyze_cmd = ["python3", "test/analyze_self_time.py"]
+top_n = 20
+# “unknown/缺失栈”等默认跳过：可按需追加
+ignore_regex = ["^\\[.*\\]$", "(?i)unknown"]
+
+# 你也可以在 profile_analyze 前插入任意脚本（可插拔）
+# 例如：先跑一次带 profile 的 benchmark 生成最新 .folded
+# [[steps]]
+# type = "command"
+# name = "generate_profile"
+# command = "bash test/run_benchmark.sh --restore_index_backup --profile"
+
+[[steps]]
+type = "target_select"
+name = "target"
+# top_self_percent | top_samples
+strategy = "top_self_percent"
+pick_top_k = 3
+
+[[steps]]
+type = "context_collect"
+name = "context"
+search_roots = ["polardb"]
+max_files = 20
+snippet_radius = 50
+max_total_matches = 120
+
+[[steps]]
+type = "codex_generate_kiro_prompt"
+name = "codex_plan"
+codex_cmd = ["codex", "exec", "--dangerously-bypass-approvals-and-sandbox"]
+max_context_chars = 12000
+
+[[steps]]
+type = "kiro_apply_and_test"
+name = "kiro"
+kiro_cmd = ["kiro-cli", "chat", "-a"]
+max_iterations = 5
+
+# 下面两类命令都通过 bash -lc 执行；请按你的环境/容器实际可用命令调整
+build_cmds = [
+  "cd polardb && bash build.sh --port=5432 --prefix=\"$HOME\"",
+]
+test_cmds = [
+  "cd polardb && make -C src/test/regress check",
+]
+
+[[steps]]
+type = "benchmark"
+name = "bench"
+warmup = 3
+runs = 10
+# 建议用 --restore_index_backup（只测查询），避免每轮构建索引耗时过长
+command = "bash test/run_benchmark.sh --restore_index_backup"
+qps_regex = "Wall clock time: .*QPS: ([0-9.]+)"
+recall_regex = "avg recall@\\d+ of \\d+ queries is: ([0-9.]+)"
+
+[[steps]]
+type = "codex_git_decide"
+name = "codex_git"
+codex_cmd = ["codex", "exec", "--dangerously-bypass-approvals-and-sandbox"]
+# codex | local（local=由本脚本执行git，codex只给出结构化决策）
+mode = "codex"
