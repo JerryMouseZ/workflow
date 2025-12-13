@@ -60,6 +60,10 @@ class RunLogger:
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self.commands_log = self.run_dir / "commands.log"
 
+    @property
+    def run_id(self) -> str:
+        return self.run_dir.name
+
     def path(self, name: str) -> Path:
         return self.run_dir / name
 

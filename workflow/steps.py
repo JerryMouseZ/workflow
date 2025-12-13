@@ -330,11 +330,6 @@ class CodexGitDecideStep(Step):
         if which(codex_cmd[0]) is None:
             raise RuntimeError(f"codex not found in PATH: {codex_cmd[0]}")
 
-        prompt_path = ctx.repo_root / self.cfg.get("prompt_file", "")
-        if not prompt_path.exists():
-            raise FileNotFoundError(f"prompt file not found: {prompt_path}")
-        prompt_template = prompt_path.read_text(encoding="utf-8")
-
         mode = str(self.cfg.get("mode", "codex"))
         prev, cur = ctx.state.get("last_benchmark_summary"), ctx.data.get("benchmark_summary")
         # 如果没有上轮数据，使用配置的初始基准值
@@ -349,15 +344,30 @@ class CodexGitDecideStep(Step):
         ctx.logger.write_text("07_git_diff_stat.txt", diff_stat + "\n")
         ctx.logger.write_text("07_git_status.txt", status + "\n")
 
-        codex_prompt = prompt_template.format(
-            head=head,
-            prev_summary=json.dumps(prev, ensure_ascii=False, indent=2) if prev else "null",
-            cur_summary=json.dumps(cur, ensure_ascii=False, indent=2) if cur else "null",
-            diff_stat=diff_stat or "(no diff)",
-            status=status or "(clean)",
-            run_dir=ctx.logger.run_dir,
-            mode=mode,
-        )
+        # 根据 mode 选择不同的 prompt 文件
+        prompt_key = "summarize_prompt_file" if mode == "local" else "prompt_file"
+        prompt_path = ctx.repo_root / self.cfg.get(prompt_key, "")
+        if not prompt_path.exists():
+            raise FileNotFoundError(f"prompt file not found: {prompt_path}")
+        prompt_template = prompt_path.read_text(encoding="utf-8")
+
+        if mode == "local":
+            codex_prompt = prompt_template.format(
+                prev_summary=json.dumps(prev, ensure_ascii=False, indent=2) if prev else "null",
+                cur_summary=json.dumps(cur, ensure_ascii=False, indent=2) if cur else "null",
+                diff_stat=diff_stat or "(no diff)",
+                run_dir=ctx.logger.run_dir,
+            )
+        else:
+            codex_prompt = prompt_template.format(
+                head=head,
+                prev_summary=json.dumps(prev, ensure_ascii=False, indent=2) if prev else "null",
+                cur_summary=json.dumps(cur, ensure_ascii=False, indent=2) if cur else "null",
+                diff_stat=diff_stat or "(no diff)",
+                status=status or "(clean)",
+                run_dir=ctx.logger.run_dir,
+                mode=mode,
+            )
 
         lp = ctx.logger.path("07_codex_git_decide.log")
         res = run_agent(cmd=codex_cmd, prompt=codex_prompt, cwd=ctx.repo_root, env=None, log_path=lp)
@@ -366,6 +376,13 @@ class CodexGitDecideStep(Step):
             raise RuntimeError(f"codex git decide failed (rc={res.returncode}), see {lp}")
 
         ctx.logger.write_text("07_codex_git_decide.output.txt", res.output_text.strip() + "\n")
+
+        # local 模式：python 执行 git 决策
+        if mode == "local":
+            outcome = self._decide_and_execute_git(ctx, prev, cur, diff_stat, status)
+        else:
+            outcome = None
+
         ctx.state["last_git_head"] = git("git rev-parse HEAD", ctx.repo_root)
         if cur:
             ctx.state["last_benchmark_summary"] = cur
@@ -376,19 +393,50 @@ class CodexGitDecideStep(Step):
             ctx.state["last_decision"] = decision_text
 
         # 追加 changelog 条目
-        self._append_changelog(ctx, cur, prev, diff_stat, decision_text)
+        self._append_changelog(ctx, cur, prev, diff_stat, decision_text, outcome)
 
-    def _append_changelog(self, ctx: WorkflowContext, cur: dict | None, prev: dict | None, diff_stat: str, decision: str) -> None:
+    def _decide_and_execute_git(self, ctx: WorkflowContext, prev: dict | None, cur: dict | None, diff_stat: str, status: str) -> str:
+        """根据 benchmark 结果决定 commit 或 checkout，返回 outcome"""
+        min_recall = float(self.cfg.get("min_recall", 0.85))
+        cur_qps = cur.get("qps", {}).get("mean") if cur else None
+        cur_recall = cur.get("recall", {}).get("mean") if cur else None
+        prev_qps = prev.get("qps", {}).get("mean") if prev else None
+
+        # 决策逻辑：recall >= min_recall 且 qps 有提升则 commit
+        should_commit = (
+            cur_qps is not None and cur_recall is not None and
+            cur_recall >= min_recall and
+            (prev_qps is None or cur_qps >= prev_qps)
+        )
+
+        if should_commit and status.strip():
+            # 执行 commit
+            git("git add -A", ctx.repo_root)
+            msg = f"perf: QPS {prev_qps:.1f} -> {cur_qps:.1f}, recall {cur_recall:.3f}"
+            git(f'git commit -m "{msg}"', ctx.repo_root)
+            ctx.logger.write_text("07_git_action.txt", f"COMMIT: {msg}\n")
+            return "commit"
+        elif status.strip():
+            # 执行 checkout
+            git("git checkout -- .", ctx.repo_root)
+            ctx.logger.write_text("07_git_action.txt", f"CHECKOUT: QPS {cur_qps}, recall {cur_recall}\n")
+            return "checkout"
+        else:
+            ctx.logger.write_text("07_git_action.txt", "NO_CHANGE: working tree clean\n")
+            return "no_change"
+
+    def _append_changelog(self, ctx: WorkflowContext, cur: dict | None, prev: dict | None, diff_stat: str, decision: str, outcome: str | None = None) -> None:
         from datetime import datetime
         changelog = ctx.state.setdefault("changelog", [])
         # 读取 changes_summary（kiro 生成的修改摘要）
         summary_path = ctx.logger.path("05_changes_summary.md")
         changes_summary = summary_path.read_text(encoding="utf-8").strip() if summary_path.exists() else ""
-        # 解析 decision 中的 outcome（commit/checkout）
-        outcome = "checkout"
-        if decision:
-            if "commit" in decision.lower() and "不 commit" not in decision and "不commit" not in decision:
-                outcome = "commit"
+        # 解析 decision 中的 outcome（commit/checkout），如果未传入则从 decision 文本推断
+        if outcome is None:
+            outcome = "checkout"
+            if decision:
+                if "commit" in decision.lower() and "不 commit" not in decision and "不commit" not in decision:
+                    outcome = "commit"
         # 提取修改的文件列表
         files_changed = [line.split("|")[0].strip() for line in diff_stat.splitlines() if "|" in line]
         # 构建 changelog 条目
