@@ -129,6 +129,11 @@ class CodexGenerateKiroPromptStep(Step):
         profile_filtered = ctx.data["profile"]["filtered"][:20]
         context_md = ctx.logger.path(ctx.data["context"]["md_path"]).read_text(encoding="utf-8")[:max_context_chars]
 
+        # 读取 faiss.md 参考文档（可选）
+        faiss_file = self.cfg.get("faiss_file", "workflow/faiss.md")
+        faiss_path = ctx.repo_root / faiss_file
+        faiss_md = faiss_path.read_text(encoding="utf-8") if faiss_path.exists() else "(无 FAISS 参考文档)"
+
         # codex 将 kiro prompt 写入此文件
         kiro_prompt_path = ctx.logger.path("04_kiro_prompt.md")
 
@@ -138,6 +143,7 @@ class CodexGenerateKiroPromptStep(Step):
             context_md=context_md,
             output_file=str(kiro_prompt_path),
             last_decision=ctx.state.get("last_decision") or "(无上一轮决策)",
+            faiss_md=faiss_md,
         )
 
         log_path = ctx.logger.path("04_codex_generate_kiro_prompt.log")
@@ -298,6 +304,11 @@ class CodexGitDecideStep(Step):
 
         mode = str(self.cfg.get("mode", "codex"))
         prev, cur = ctx.state.get("last_benchmark_summary"), ctx.data.get("benchmark_summary")
+        # 如果没有上轮数据，使用配置的初始基准值
+        if not prev:
+            init_qps = ctx.workflow_cfg.get("initial_qps", 0.0)
+            init_recall = ctx.workflow_cfg.get("initial_recall", 0.85)
+            prev = {"qps": {"mean": init_qps}, "recall": {"mean": init_recall}, "_initial": True}
         head = git("git rev-parse HEAD", ctx.repo_root)
         diff_stat = git("git diff --stat", ctx.repo_root)
         status = git("git status --porcelain", ctx.repo_root)
