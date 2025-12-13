@@ -39,6 +39,20 @@ python3 workflow/run.py --config workflow/config.toml --only name:profile,name:t
 
 也可以在 `[[steps]]` 里加 `enabled = false` 直接禁用某一步。
 
+## 从中断位置继续执行（--resume）
+
+如果 workflow 执行中断（如手动停止或出错），可以使用 `--resume` 从上次完成的步骤继续：
+
+```bash
+python3 workflow/run.py --config workflow/config.toml --resume
+```
+
+- 执行进度保存在 `state.json` 的 `last_completed_step_idx` 字段
+- `--resume` 会跳过已完成的步骤，从下一个步骤开始执行
+- `--resume` 会复用同一个 `workflow/logs/<run_id>/` 目录继续写日志（`run_id` 保存在 `state.json` 的 `active_run_id`/`active_round_idx` 字段）
+- 当工作流“完整跑完全部启用步骤”（包含因 `--resume` 被跳过的已完成步骤）后，进度会自动重置；如果使用 `--only`/`--skip` 只跑子集步骤，进度不会重置，便于分段调试与继续执行
+- 可与 `--skip`/`--only` 组合使用
+
 ## 关键点
 
 - Profile 分析：强制调用 `python3 test/analyze_self_time.py`，并在工作流侧对结果进行过滤（默认跳过 `^\[.*\]$` / `unknown` 之类的“未知项”）。

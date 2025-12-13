@@ -26,6 +26,7 @@ def main() -> int:
     )
     parser.add_argument("--list-steps", action="store_true", help="List steps from config and exit")
     parser.add_argument("--dry-run", action="store_true", help="Print step plan and exit without running")
+    parser.add_argument("--resume", action="store_true", help="Resume from last completed step (skip already completed steps)")
     args = parser.parse_args()
 
     repo_root = Path(os.getcwd())
@@ -39,6 +40,7 @@ def main() -> int:
         config=cfg,
         skip_selectors=args.skip,
         only_selectors=args.only,
+        resume=args.resume,
     )
     if args.list_steps:
         print(runner.format_steps())

@@ -34,6 +34,19 @@ def _now_id() -> str:
     return _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
 
 
+def _latest_run_id(log_dir: Path, *, round_idx: int) -> str | None:
+    if not log_dir.exists():
+        return None
+    suffix = f"_r{round_idx}"
+    candidates: list[str] = []
+    for p in log_dir.iterdir():
+        if p.is_dir() and p.name.endswith(suffix):
+            candidates.append(p.name)
+    if not candidates:
+        return None
+    return sorted(candidates)[-1]
+
+
 def _json_dump(path: Path, obj: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(obj, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -145,21 +158,24 @@ def _which(exe: str) -> str | None:
 
 
 def _latest_folded_file(repo_root: Path) -> Path | None:
+    """获取最新的 .folded 或 .perf.data 文件，与 analyze_self_time.py 保持一致"""
     prof_dir = repo_root / "test" / "profile_output"
     if not prof_dir.exists():
         return None
-    folded = list(prof_dir.glob("*.folded"))
-    if not folded:
+    all_files = list(prof_dir.glob("*.folded")) + list(prof_dir.glob("*.perf.data"))
+    if not all_files:
         return None
-    return max(folded, key=lambda p: p.stat().st_mtime)
+    return max(all_files, key=lambda p: p.stat().st_mtime)
 
 
 def _parse_self_time_table(text: str) -> list[dict[str, Any]]:
     entries: list[dict[str, Any]] = []
     in_table = False
+    has_samples_col = False
     for line in text.splitlines():
         if line.strip().startswith("Rank") and "Function" in line:
             in_table = True
+            has_samples_col = "Samples" in line
             continue
         if in_table and re.fullmatch(r"-{10,}", line.strip()):
             continue
@@ -167,13 +183,24 @@ def _parse_self_time_table(text: str) -> list[dict[str, Any]]:
             break
         if not in_table:
             continue
-        m = re.match(r"^\s*(\d+)\s+(\d+(?:\.\d+)?)%\s+(\d+)\s+(.*)$", line)
-        if not m:
-            continue
-        rank = int(m.group(1))
-        self_pct = float(m.group(2))
-        samples = int(m.group(3))
-        func = m.group(4).strip()
+        if has_samples_col:
+            # folded: "1  12.34%  12345  Function"
+            m = re.match(r"^\s*(\d+)\s+(\d+(?:\.\d+)?)%\s+(\d+)\s+(.*)$", line)
+            if not m:
+                continue
+            rank = int(m.group(1))
+            self_pct = float(m.group(2))
+            samples = int(m.group(3))
+            func = m.group(4).strip()
+        else:
+            # perf.data: "1  12.34%  Function"
+            m = re.match(r"^\s*(\d+)\s+(\d+(?:\.\d+)?)%\s+(.*)$", line)
+            if not m:
+                continue
+            rank = int(m.group(1))
+            self_pct = float(m.group(2))
+            samples = 0
+            func = m.group(3).strip()
         entries.append({"rank": rank, "self_pct": self_pct, "samples": samples, "function": func})
     return entries
 
@@ -373,7 +400,7 @@ class ProfileAnalyzeStep(Step):
 
         latest = _latest_folded_file(ctx.repo_root)
         if latest is None:
-            raise RuntimeError("no .folded files found under test/profile_output/")
+            raise RuntimeError("no .folded or .perf.data files found under test/profile_output/")
 
         log_path = ctx.logger.path("01_profile_analyze.log")
         res = _run_cmd(
@@ -447,6 +474,14 @@ class CodexGenerateKiroPromptStep(Step):
         if _which(codex_cmd[0]) is None:
             raise RuntimeError(f"codex not found in PATH: {codex_cmd[0]}")
 
+        prompt_file = self.cfg.get("prompt_file")
+        if not prompt_file:
+            raise ValueError("codex_generate_kiro_prompt requires prompt_file")
+        prompt_path = ctx.repo_root / prompt_file
+        if not prompt_path.exists():
+            raise FileNotFoundError(f"prompt file not found: {prompt_path}")
+        prompt_template = prompt_path.read_text(encoding="utf-8")
+
         max_context_chars = int(self.cfg.get("max_context_chars", 12000))
         targets = ctx.data["targets"]
         profile_filtered = ctx.data["profile"]["filtered"][:20]
@@ -459,30 +494,11 @@ class CodexGenerateKiroPromptStep(Step):
             [f"- {e['function']} (self%={e['self_pct']}, samples={e['samples']})" for e in profile_filtered]
         )
 
-        codex_prompt = f"""你是性能优化总控（Orchestrator）。
-输入：profile self-time top 列表（已过滤unknown），以及从仓库中抽取的与热点函数相关的代码片段/调用点。
-
-目标：
-1) 基于 profile 制定 1-2 个可验证的性能假设；
-2) 从候选函数中选择本轮主要优化目标（默认第一项），聚焦可落地的小步优化（数据结构、缓存、分支、内存访问、锁等），避免大改架构；
-3) 产出一段“将被直接喂给 kiro-cli chat -a 的中文 prompt”，内容必须包含：
-   - 明确的修改方案（分步骤，优先 1-3 个改动点）
-   - 需要查看/修改的代码文件路径（可引用下面的 context）
-   - 你推断的调用路径（可以是启发式，例如 caller -> callee）
-   - 需要运行的编译/单测命令（要求修改后必须通过；若命令不适用则提示改为可用命令）
-   - 若需要新增/调整微基准或日志，必须默认关闭、且不影响比赛输出
-
-约束：
-- 尽量保持变更小、可回退、可归因；避免引入非必要依赖。
-- 不要把未知项（例如 [Missed User Stack]）当成优化目标。
-- 最终输出只包含“给 kiro 的 prompt 文本”，不要附加解释。
-
-候选热点函数（按优先级）：\n{target_lines}
-
-过滤后的 top 列表（用于辅助判断）：\n{prof_lines}
-
-上下文（节选）：\n{context_md}
-"""
+        codex_prompt = prompt_template.format(
+            target_lines=target_lines,
+            prof_lines=prof_lines,
+            context_md=context_md,
+        )
 
         log_path = ctx.logger.path("04_codex_generate_kiro_prompt.log")
         res = _run_agent(cmd=codex_cmd, prompt=codex_prompt, cwd=ctx.repo_root, env=None, log_path=log_path)
@@ -503,6 +519,14 @@ class KiroApplyAndTestStep(Step):
             raise ValueError("kiro_apply_and_test requires kiro_cmd=[...]")
         if _which(kiro_cmd[0]) is None:
             raise RuntimeError(f"kiro-cli not found in PATH: {kiro_cmd[0]}")
+
+        retry_prompt_file = self.cfg.get("retry_prompt_file")
+        if not retry_prompt_file:
+            raise ValueError("kiro_apply_and_test requires retry_prompt_file")
+        retry_prompt_path = ctx.repo_root / retry_prompt_file
+        if not retry_prompt_path.exists():
+            raise FileNotFoundError(f"retry prompt file not found: {retry_prompt_path}")
+        retry_prompt_template = retry_prompt_path.read_text(encoding="utf-8")
 
         build_cmds = list(self.cfg.get("build_cmds", []))
         test_cmds = list(self.cfg.get("test_cmds", []))
@@ -551,12 +575,7 @@ class KiroApplyAndTestStep(Step):
             # failure: craft retry prompt
             last_log = (test_logs[-1] if test_logs else build_logs[-1] if build_logs else kiro_log)
             err_tail = last_log.read_text(encoding="utf-8", errors="ignore").splitlines()[-120:]
-            prompt = (
-                "上一次修改后，编译/单测失败。请基于当前工作区继续修复，直到通过；不要回退性能优化目标。\n\n"
-                "失败日志（末尾截断）：\n"
-                + "\n".join(err_tail)
-                + "\n"
-            )
+            prompt = retry_prompt_template.format(error_log="\n".join(err_tail))
 
         raise RuntimeError(f"tests did not pass after {max_iterations} iterations; see workflow logs in {ctx.logger.run_dir}")
 
@@ -636,8 +655,16 @@ class CodexGitDecideStep(Step):
             raise ValueError("codex_git_decide requires codex_cmd=[...]")
         if _which(codex_cmd[0]) is None:
             raise RuntimeError(f"codex not found in PATH: {codex_cmd[0]}")
-        mode = str(self.cfg.get("mode", "codex"))
 
+        prompt_file = self.cfg.get("prompt_file")
+        if not prompt_file:
+            raise ValueError("codex_git_decide requires prompt_file")
+        prompt_path = ctx.repo_root / prompt_file
+        if not prompt_path.exists():
+            raise FileNotFoundError(f"prompt file not found: {prompt_path}")
+        prompt_template = prompt_path.read_text(encoding="utf-8")
+
+        mode = str(self.cfg.get("mode", "codex"))
         prev = ctx.state.get("last_benchmark_summary")
         cur = ctx.data.get("benchmark_summary")
         head = _git("git rev-parse HEAD", ctx.repo_root)
@@ -647,33 +674,15 @@ class CodexGitDecideStep(Step):
         ctx.logger.write_text("07_git_diff_stat.txt", diff_stat + "\n")
         ctx.logger.write_text("07_git_status.txt", status + "\n")
 
-        codex_prompt = f"""你是性能优化归因与版本决策助手。
-你需要基于本轮 benchmark 结果（与上轮对比）以及当前代码变更，决定：
-- 是否执行 git commit（给出合适的 commit message，并确保把相关文件 add 进去）
-- 或者执行 git checkout / reset 回退变更
-无论 commit 还是 checkout，都必须保留本轮日志目录：{ctx.logger.run_dir}
-
-当前 HEAD: {head}
-
-上轮 benchmark summary（可能为空）:
-{json.dumps(prev, ensure_ascii=False, indent=2) if prev else "null"}
-
-本轮 benchmark summary:
-{json.dumps(cur, ensure_ascii=False, indent=2) if cur else "null"}
-
-git diff --stat:
-{diff_stat if diff_stat else "(no diff)"}
-
-git status --porcelain:
-{status if status else "(clean)"}
-
-要求：
-1) 先用文字给出归因判断与下一轮演化方向（简短但具体）。
-2) 然后如果 mode=codex：请直接在仓库中执行对应 git 命令（commit 或 checkout/reset），并输出执行结果。
-3) 无论执行了什么，请把“原因 + 下一轮方向”写入 {ctx.logger.run_dir}/07_decision.md（用重定向或 heredoc 均可）。
-
-mode={mode}
-"""
+        codex_prompt = prompt_template.format(
+            head=head,
+            prev_summary=json.dumps(prev, ensure_ascii=False, indent=2) if prev else "null",
+            cur_summary=json.dumps(cur, ensure_ascii=False, indent=2) if cur else "null",
+            diff_stat=diff_stat if diff_stat else "(no diff)",
+            status=status if status else "(clean)",
+            run_dir=ctx.logger.run_dir,
+            mode=mode,
+        )
 
         lp = ctx.logger.path("07_codex_git_decide.log")
         res = _run_agent(cmd=codex_cmd, prompt=codex_prompt, cwd=ctx.repo_root, env=None, log_path=lp)
@@ -710,6 +719,7 @@ class WorkflowRunner:
         config: dict[str, Any],
         skip_selectors: list[str] | None = None,
         only_selectors: list[str] | None = None,
+        resume: bool = False,
     ) -> None:
         self.repo_root = repo_root
         self.config = config
@@ -717,6 +727,7 @@ class WorkflowRunner:
         self.workflow_cfg: dict[str, Any] = dict(config.get("workflow", {}))
         self.skip_selectors = self._normalize_selectors(skip_selectors)
         self.only_selectors = self._normalize_selectors(only_selectors)
+        self.resume = resume
 
     @staticmethod
     def _normalize_selectors(raw: list[str] | None) -> list[str]:
@@ -815,11 +826,40 @@ class WorkflowRunner:
             except Exception:
                 state = {}
 
+        # resume: 获取上次完成的步骤索引和数据
+        last_completed_idx = state.get("last_completed_step_idx", 0) if self.resume else 0
+        persisted_data = state.get("data", {}) if self.resume else {}
+
         for round_idx in range(1, rounds + 1):
-            run_id = f"{_now_id()}_r{round_idx}"
+            # resume: 使用同一个 run_id/log 目录，避免日志分散在多个目录
+            run_id: str
+            if self.resume:
+                active_run_id = state.get("active_run_id")
+                active_round_idx = state.get("active_round_idx")
+                if (
+                    isinstance(active_run_id, str)
+                    and isinstance(active_round_idx, int)
+                    and active_round_idx == round_idx
+                    and active_run_id.endswith(f"_r{round_idx}")
+                ):
+                    run_id = active_run_id
+                elif last_completed_idx > 0:
+                    run_id = _latest_run_id(log_dir, round_idx=round_idx) or f"{_now_id()}_r{round_idx}"
+                else:
+                    run_id = f"{_now_id()}_r{round_idx}"
+            else:
+                run_id = f"{_now_id()}_r{round_idx}"
             run_dir = log_dir / run_id
             logger = RunLogger(run_dir)
 
+            # 记录当前活跃 run，供 --resume 继续使用同一个日志目录
+            state["active_run_id"] = run_id
+            state["active_round_idx"] = round_idx
+            _json_dump(state_file, state)
+
+            env_name = "00_env.json"
+            if self.resume and logger.path(env_name).exists():
+                env_name = f"00_env_resume_{_now_id()}.json"
             env_info = {
                 "run_id": run_id,
                 "round": round_idx,
@@ -827,8 +867,10 @@ class WorkflowRunner:
                 "git_head": _git("git rev-parse HEAD", self.repo_root),
                 "skip_selectors": self.skip_selectors,
                 "only_selectors": self.only_selectors,
+                "resume": self.resume,
+                "resume_from_idx": last_completed_idx + 1 if self.resume and last_completed_idx > 0 else None,
             }
-            _json_dump(logger.path("00_env.json"), env_info)
+            _json_dump(logger.path(env_name), env_info)
 
             ctx = WorkflowContext(
                 repo_root=self.repo_root,
@@ -837,7 +879,7 @@ class WorkflowRunner:
                 logger=logger,
                 state_file=state_file,
                 state=state,
-                data={},
+                data=dict(persisted_data),
             )
 
             step_plan: list[dict[str, Any]] = []
@@ -846,6 +888,10 @@ class WorkflowRunner:
                 if t not in STEP_REGISTRY:
                     raise ValueError(f"unknown step type: {t}")
                 run_it, reason = self._should_run_step(step_cfg=s_cfg, idx=idx)
+                # resume: 跳过已完成的步骤
+                if run_it and self.resume and idx <= last_completed_idx:
+                    run_it = False
+                    reason = f"resumed (completed in previous run, idx<={last_completed_idx})"
                 step_plan.append(
                     {
                         "idx": idx,
@@ -856,7 +902,10 @@ class WorkflowRunner:
                         "reason": reason,
                     }
                 )
-            _json_dump(logger.path("00_step_plan.json"), step_plan)
+            step_plan_name = "00_step_plan.json"
+            if self.resume and logger.path(step_plan_name).exists():
+                step_plan_name = f"00_step_plan_resume_{_now_id()}.json"
+            _json_dump(logger.path(step_plan_name), step_plan)
 
             for p in step_plan:
                 if p["action"] != "run":
@@ -865,5 +914,28 @@ class WorkflowRunner:
                 s_cfg = self.steps_cfg[idx - 1]
                 t = str(p["type"])
                 STEP_REGISTRY[t](s_cfg).run(ctx)
+                # 记录完成的步骤和数据
+                state["last_completed_step_idx"] = idx
+                state["data"] = ctx.data
+                _json_dump(state_file, state)
 
-            _json_dump(state_file, state)
+            # 全部步骤都完成（或因 resume 已完成）时，才重置 state。
+            # 这样 `--only idx:1` 之后可用 `--resume --only idx:2` 接着跑。
+            completed_workflow = True
+            for p in step_plan:
+                if not p.get("enabled", True):
+                    continue
+                if p["action"] == "run":
+                    continue
+                reason = str(p.get("reason") or "")
+                if self.resume and reason.startswith("resumed (completed in previous run"):
+                    continue
+                completed_workflow = False
+                break
+
+            if completed_workflow:
+                state["last_completed_step_idx"] = 0
+                state["data"] = {}
+                state.pop("active_run_id", None)
+                state.pop("active_round_idx", None)
+                _json_dump(state_file, state)

@@ -39,37 +39,37 @@ max_total_matches = 120
 type = "codex_generate_kiro_prompt"
 name = "codex_plan"
 codex_cmd = ["codex", "exec", "--dangerously-bypass-approvals-and-sandbox"]
+prompt_file = "workflow/prompts/codex_generate_kiro.md"
 max_context_chars = 12000
 
 [[steps]]
 type = "kiro_apply_and_test"
 name = "kiro"
 kiro_cmd = ["kiro-cli", "chat", "-a"]
+retry_prompt_file = "workflow/prompts/kiro_retry.md"
 max_iterations = 5
 
 # 下面两类命令都通过 bash -lc 执行；请按你的环境/容器实际可用命令调整
 build_cmds = [
-  "cd polardb && bash build.sh --port=5432 --prefix=\"$HOME\"",
+  "cd polardb && make install-world-bin -j32 && ~/tmp_polardb_pg_15_base/bin/pg_ctl stop -D ~/tmp_polardb_pg_15_primary",
 ]
 test_cmds = [
-  "cd polardb && make -C src/test/regress check",
+  "cd polardb && make -C src/test/regress check -j32",
 ]
 
 [[steps]]
 type = "benchmark"
 name = "bench"
-# 调试时可临时禁用某一步：
-# enabled = false
 warmup = 3
 runs = 10
-# 建议用 --restore_index_backup（只测查询），避免每轮构建索引耗时过长
-command = "bash test/run_benchmark.sh --restore_index_backup"
-qps_regex = "Wall clock time: .*QPS: ([0-9.]+)"
+command = "cd test && bash run_benchmark.sh --base_file dataset_10M/base.10M.filtered.fbin --query_file dataset_10M/10M.query.10000.fbin --gt_file dataset_10M/10M.groundtruth.10000.ibin --skip_load --skip_index"
+qps_regex = ".*QPS is: ([0-9.]+)"
 recall_regex = "avg recall@\\d+ of \\d+ queries is: ([0-9.]+)"
 
 [[steps]]
 type = "codex_git_decide"
 name = "codex_git"
 codex_cmd = ["codex", "exec", "--dangerously-bypass-approvals-and-sandbox"]
+prompt_file = "workflow/prompts/codex_git_decide.md"
 # codex | local（local=由本脚本执行git，codex只给出结构化决策）
 mode = "codex"
