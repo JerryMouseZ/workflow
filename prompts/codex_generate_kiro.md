@@ -29,7 +29,7 @@
 过滤后的 top 列表（用于辅助判断）：
 {prof_lines}
 
-上下文（节选）：
+上下文：
 {context_md}
 
 FAISS HNSW 优化参考文档：

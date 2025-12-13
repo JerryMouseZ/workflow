@@ -40,7 +40,7 @@ max_total_matches = 120
 [[steps]]
 type = "codex_generate_kiro_prompt"
 name = "codex_plan"
-codex_cmd = ["codex", "exec", "--dangerously-bypass-approvals-and-sandbox"]
+codex_cmd = ["kiro-cli", "chat", "-a"]
 prompt_file = "workflow/prompts/codex_generate_kiro.md"
 max_context_chars = 12000
 
