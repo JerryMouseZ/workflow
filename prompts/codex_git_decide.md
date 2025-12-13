@@ -2,6 +2,7 @@
 你需要基于本轮 benchmark 结果（与上轮对比）以及当前代码变更，决定：
 - 是否执行 git commit（给出合适的 commit message，并确保把相关文件 add 进去）
 - 或者执行 git checkout / reset 回退变更
+- 请确保recall值大于0.85
 无论 commit 还是 checkout，都必须保留本轮日志目录：{run_dir}
 
 当前 HEAD: {head}

@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any
 
 from .utils import (
     collect_context_md, filter_profile_entries, git, json_dump, latest_folded_file,
-    parse_self_time_table, pick_targets, run_agent, run_cmd, run_shell, which,
+    parse_self_time_table, pick_targets, run_agent, run_agent_file, run_cmd, run_shell, which,
 )
 
 if TYPE_CHECKING:
@@ -129,10 +129,15 @@ class CodexGenerateKiroPromptStep(Step):
         profile_filtered = ctx.data["profile"]["filtered"][:20]
         context_md = ctx.logger.path(ctx.data["context"]["md_path"]).read_text(encoding="utf-8")[:max_context_chars]
 
+        # codex 将 kiro prompt 写入此文件
+        kiro_prompt_path = ctx.logger.path("04_kiro_prompt.md")
+
         codex_prompt = prompt_template.format(
             target_lines="\n".join([f"- {t['function']} (self%={t['self_pct']}, samples={t['samples']})" for t in targets]),
             prof_lines="\n".join([f"- {e['function']} (self%={e['self_pct']}, samples={e['samples']})" for e in profile_filtered]),
             context_md=context_md,
+            output_file=str(kiro_prompt_path),
+            last_decision=ctx.state.get("last_decision") or "(无上一轮决策)",
         )
 
         log_path = ctx.logger.path("04_codex_generate_kiro_prompt.log")
@@ -141,14 +146,17 @@ class CodexGenerateKiroPromptStep(Step):
         if res.returncode != 0:
             raise RuntimeError(f"codex exec failed (rc={res.returncode}), see {log_path}")
 
-        ctx.logger.write_text("04_kiro_prompt.txt", res.output_text.strip() + "\n")
-        ctx.data["kiro_prompt"] = res.output_text
+        if not kiro_prompt_path.exists():
+            raise RuntimeError(f"codex did not create kiro prompt file: {kiro_prompt_path}")
+        ctx.data["kiro_prompt_file"] = str(kiro_prompt_path)
 
 
 class KiroApplyAndTestStep(Step):
     type_name = "kiro_apply_and_test"
 
     def run(self, ctx: WorkflowContext) -> None:
+        from pathlib import Path as _Path
+
         kiro_cmd = self.cfg.get("kiro_cmd")
         if not isinstance(kiro_cmd, list) or not kiro_cmd:
             raise ValueError("kiro_apply_and_test requires kiro_cmd=[...]")
@@ -163,14 +171,19 @@ class KiroApplyAndTestStep(Step):
         build_cmds = list(self.cfg.get("build_cmds", []))
         test_cmds = list(self.cfg.get("test_cmds", []))
         max_iterations = int(self.cfg.get("max_iterations", 5))
-        prompt = str(ctx.data.get("kiro_prompt", "")).strip()
-        if not prompt:
-            raise RuntimeError("missing kiro_prompt from previous step")
+
+        # 首次使用 codex 生成的 prompt 文件
+        prompt_file = ctx.data.get("kiro_prompt_file")
+        if not prompt_file:
+            raise RuntimeError("missing kiro_prompt_file from previous step")
+        prompt_path = _Path(prompt_file)
+        if not prompt_path.exists():
+            raise RuntimeError(f"kiro prompt file not found: {prompt_path}")
 
         for i in range(1, max_iterations + 1):
             kiro_log = ctx.logger.path(f"05_kiro_iter_{i}.log")
-            res = run_agent(cmd=kiro_cmd, prompt=prompt + "\n", cwd=ctx.repo_root, env=None, log_path=kiro_log)
-            ctx.logger.append_command(" ".join(kiro_cmd), res.returncode, kiro_log)
+            res = run_agent_file(cmd=kiro_cmd, input_file=prompt_path, cwd=ctx.repo_root, env=None, log_path=kiro_log)
+            ctx.logger.append_command(f"{' '.join(kiro_cmd)} < {prompt_path}", res.returncode, kiro_log)
             if res.returncode != 0:
                 raise RuntimeError(f"kiro-cli failed (rc={res.returncode}), see {kiro_log}")
 
@@ -201,9 +214,12 @@ class KiroApplyAndTestStep(Step):
                 ctx.logger.write_text("05_test_status.txt", f"PASS after iteration {i}\n")
                 return
 
+            # 失败时生成 retry prompt 文件
             last_log = test_logs[-1] if test_logs else build_logs[-1] if build_logs else kiro_log
             err_tail = last_log.read_text(encoding="utf-8", errors="ignore").splitlines()[-120:]
-            prompt = retry_prompt_template.format(error_log="\n".join(err_tail))
+            retry_content = retry_prompt_template.format(error_log="\n".join(err_tail))
+            prompt_path = ctx.logger.path(f"05_kiro_retry_{i}.md")
+            prompt_path.write_text(retry_content, encoding="utf-8")
 
         raise RuntimeError(f"tests did not pass after {max_iterations} iterations; see {ctx.logger.run_dir}")
 
@@ -309,6 +325,10 @@ class CodexGitDecideStep(Step):
         ctx.state["last_git_head"] = git("git rev-parse HEAD", ctx.repo_root)
         if cur:
             ctx.state["last_benchmark_summary"] = cur
+        # 保存 decision 供下一轮参考
+        decision_path = ctx.logger.path("07_decision.md")
+        if decision_path.exists():
+            ctx.state["last_decision"] = decision_path.read_text(encoding="utf-8")
 
 
 # Step 注册表

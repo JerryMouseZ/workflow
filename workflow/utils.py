@@ -117,6 +117,12 @@ def run_agent(*, cmd: list[str], prompt: str, cwd: Path, env: dict[str, str] | N
     return run_cmd(cmd=cmd, cwd=cwd, env=env, stdin_text=prompt, log_path=log_path, tee=tee)
 
 
+def run_agent_file(*, cmd: list[str], input_file: Path, cwd: Path, env: dict[str, str] | None, log_path: Path, tee: bool = True) -> CmdResult:
+    """使用 shell 重定向从文件输入运行 agent: cmd < input_file"""
+    shell_cmd = " ".join(cmd) + f" < {input_file}"
+    return run_cmd(cmd=["bash", "-lc", shell_cmd], cwd=cwd, env=env, stdin_text=None, log_path=log_path, tee=tee)
+
+
 def git(cmd: str, repo_root: Path) -> str:
     return subprocess.check_output(["bash", "-lc", cmd], cwd=str(repo_root), text=True).strip()
 
