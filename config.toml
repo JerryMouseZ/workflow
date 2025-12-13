@@ -5,8 +5,8 @@ rounds = 1
 log_dir = "workflow/logs"
 state_file = "workflow/state.json"
 # 初始基准值：第一轮没有上轮数据时使用
-initial_qps = 0.0
-initial_recall = 0.85
+initial_qps = 3500
+initial_recall = 0.858
 
 [[steps]]
 type = "profile_analyze"
