@@ -703,11 +703,105 @@ STEP_REGISTRY: dict[str, type[Step]] = {
 
 
 class WorkflowRunner:
-    def __init__(self, *, repo_root: Path, config: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        *,
+        repo_root: Path,
+        config: dict[str, Any],
+        skip_selectors: list[str] | None = None,
+        only_selectors: list[str] | None = None,
+    ) -> None:
         self.repo_root = repo_root
         self.config = config
         self.steps_cfg: list[dict[str, Any]] = list(config.get("steps", []))
         self.workflow_cfg: dict[str, Any] = dict(config.get("workflow", {}))
+        self.skip_selectors = self._normalize_selectors(skip_selectors)
+        self.only_selectors = self._normalize_selectors(only_selectors)
+
+    @staticmethod
+    def _normalize_selectors(raw: list[str] | None) -> list[str]:
+        if not raw:
+            return []
+        out: list[str] = []
+        for item in raw:
+            if item is None:
+                continue
+            for tok in str(item).split(","):
+                tok = tok.strip()
+                if tok:
+                    out.append(tok)
+        return out
+
+    @staticmethod
+    def _matches_selector(*, step_cfg: dict[str, Any], idx: int, selector: str) -> bool:
+        sel = selector.strip()
+        if not sel:
+            return False
+
+        step_type = str(step_cfg.get("type", "")).strip()
+        step_name = str(step_cfg.get("name", "")).strip()
+
+        def norm_prefix(s: str) -> tuple[str, str] | None:
+            for p in ("type:", "type=", "name:", "name=", "idx:", "idx="):
+                if s.startswith(p):
+                    return p[:-1], s[len(p) :].strip()
+            return None
+
+        if sel.startswith("#"):
+            return sel[1:].strip().isdigit() and int(sel[1:].strip()) == idx
+
+        pref = norm_prefix(sel)
+        if pref is not None:
+            key, value = pref
+            if key == "type":
+                return value == step_type
+            if key == "name":
+                return value == step_name
+            if key == "idx":
+                return value.isdigit() and int(value) == idx
+            return False
+
+        if sel.isdigit() and int(sel) == idx:
+            return True
+
+        # plain token: match name or type
+        return sel == step_name or sel == step_type
+
+    def _should_run_step(self, *, step_cfg: dict[str, Any], idx: int) -> tuple[bool, str | None]:
+        enabled = step_cfg.get("enabled", True)
+        if enabled is False:
+            return False, "disabled (enabled=false)"
+
+        if self.only_selectors:
+            ok = any(self._matches_selector(step_cfg=step_cfg, idx=idx, selector=s) for s in self.only_selectors)
+            if not ok:
+                return False, "not selected (--only)"
+
+        if self.skip_selectors:
+            hit = any(self._matches_selector(step_cfg=step_cfg, idx=idx, selector=s) for s in self.skip_selectors)
+            if hit:
+                return False, "skipped (--skip)"
+
+        return True, None
+
+    def format_steps(self) -> str:
+        lines = ["idx  enabled  type                      name"]
+        for i, s in enumerate(self.steps_cfg, 1):
+            enabled = s.get("enabled", True)
+            t = str(s.get("type", "")).strip()
+            n = str(s.get("name", "")).strip()
+            lines.append(f"{i:>3}  {str(bool(enabled)).lower():<7}  {t:<24}  {n}")
+        return "\n".join(lines)
+
+    def format_step_plan(self) -> str:
+        lines = ["idx  action   type                      name  reason"]
+        for i, s in enumerate(self.steps_cfg, 1):
+            run, reason = self._should_run_step(step_cfg=s, idx=i)
+            action = "run" if run else "skip"
+            t = str(s.get("type", "")).strip()
+            n = str(s.get("name", "")).strip()
+            lines.append(f"{i:>3}  {action:<6}  {t:<24}  {n:<20}  {reason or ''}".rstrip())
+        return "\n".join(lines)
 
     def run(self) -> None:
         rounds = int(self.workflow_cfg.get("rounds", 1))
@@ -731,6 +825,8 @@ class WorkflowRunner:
                 "round": round_idx,
                 "cwd": str(self.repo_root),
                 "git_head": _git("git rev-parse HEAD", self.repo_root),
+                "skip_selectors": self.skip_selectors,
+                "only_selectors": self.only_selectors,
             }
             _json_dump(logger.path("00_env.json"), env_info)
 
@@ -744,10 +840,30 @@ class WorkflowRunner:
                 data={},
             )
 
-            for s_cfg in self.steps_cfg:
+            step_plan: list[dict[str, Any]] = []
+            for idx, s_cfg in enumerate(self.steps_cfg, 1):
                 t = s_cfg.get("type")
                 if t not in STEP_REGISTRY:
                     raise ValueError(f"unknown step type: {t}")
+                run_it, reason = self._should_run_step(step_cfg=s_cfg, idx=idx)
+                step_plan.append(
+                    {
+                        "idx": idx,
+                        "type": str(t),
+                        "name": str(s_cfg.get("name", "")).strip(),
+                        "enabled": bool(s_cfg.get("enabled", True)),
+                        "action": "run" if run_it else "skip",
+                        "reason": reason,
+                    }
+                )
+            _json_dump(logger.path("00_step_plan.json"), step_plan)
+
+            for p in step_plan:
+                if p["action"] != "run":
+                    continue
+                idx = int(p["idx"])
+                s_cfg = self.steps_cfg[idx - 1]
+                t = str(p["type"])
                 STEP_REGISTRY[t](s_cfg).run(ctx)
 
             _json_dump(state_file, state)

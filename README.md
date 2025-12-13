@@ -16,6 +16,29 @@ cp workflow/config.example.toml workflow/config.toml
 python3 workflow/run.py --config workflow/config.toml
 ```
 
+## 跳过/只运行部分步骤（用于调试）
+
+先查看 config 里有哪些 step：
+
+```bash
+python3 workflow/run.py --config workflow/config.toml --list-steps
+```
+
+只打印“本次会跑哪些步骤”，但不实际执行：
+
+```bash
+python3 workflow/run.py --config workflow/config.toml --dry-run --skip bench,codex_git
+```
+
+实际执行时跳过某些步骤（selector 可用 `name:<name>` / `type:<type>` / `idx:<i>` / `#<i>`，或直接写 token 匹配 name/type）：
+
+```bash
+python3 workflow/run.py --config workflow/config.toml --skip bench,codex_git
+python3 workflow/run.py --config workflow/config.toml --only name:profile,name:target,name:context
+```
+
+也可以在 `[[steps]]` 里加 `enabled = false` 直接禁用某一步。
+
 ## 关键点
 
 - Profile 分析：强制调用 `python3 test/analyze_self_time.py`，并在工作流侧对结果进行过滤（默认跳过 `^\[.*\]$` / `unknown` 之类的“未知项”）。

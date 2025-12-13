@@ -58,6 +58,8 @@ test_cmds = [
 [[steps]]
 type = "benchmark"
 name = "bench"
+# 调试时可临时禁用某一步：
+# enabled = false
 warmup = 3
 runs = 10
 # 建议用 --restore_index_backup（只测查询），避免每轮构建索引耗时过长
