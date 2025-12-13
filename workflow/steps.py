@@ -129,13 +129,11 @@ class CodexGenerateKiroPromptStep(Step):
         profile_filtered = ctx.data["profile"]["filtered"][:20]
         context_md = ctx.logger.path(ctx.data["context"]["md_path"]).read_text(encoding="utf-8")[:max_context_chars]
 
-        # 读取 faiss.md 参考文档（可选）
-        faiss_file = self.cfg.get("faiss_file", "workflow/faiss.md")
-        faiss_path = ctx.repo_root / faiss_file
-        faiss_md = faiss_path.read_text(encoding="utf-8") if faiss_path.exists() else "(无 FAISS 参考文档)"
-
         # codex 将 kiro prompt 写入此文件
         kiro_prompt_path = ctx.logger.path("04_kiro_prompt.md")
+
+        # 格式化历史 changelog
+        changelog_text = self._format_changelog(ctx.state.get("changelog", []))
 
         codex_prompt = prompt_template.format(
             target_lines="\n".join([f"- {t['function']} (self%={t['self_pct']}, samples={t['samples']})" for t in targets]),
@@ -143,7 +141,8 @@ class CodexGenerateKiroPromptStep(Step):
             context_md=context_md,
             output_file=str(kiro_prompt_path),
             last_decision=ctx.state.get("last_decision") or "(无上一轮决策)",
-            faiss_md=faiss_md,
+            run_id=ctx.logger.run_id,
+            changelog=changelog_text,
         )
 
         log_path = ctx.logger.path("04_codex_generate_kiro_prompt.log")
@@ -155,6 +154,19 @@ class CodexGenerateKiroPromptStep(Step):
         if not kiro_prompt_path.exists():
             raise RuntimeError(f"codex did not create kiro prompt file: {kiro_prompt_path}")
         ctx.data["kiro_prompt_file"] = str(kiro_prompt_path)
+
+    def _format_changelog(self, changelog: list) -> str:
+        if not changelog:
+            return "(无历史变更记录)"
+        lines = []
+        for e in changelog[-10:]:  # 只保留最近 10 条
+            outcome_icon = "✓" if e.get("outcome") == "commit" else "✗"
+            qps_b, qps_a = e.get("qps_before"), e.get("qps_after")
+            qps_delta = f"{qps_a - qps_b:+.1f}" if qps_b and qps_a else "N/A"
+            lines.append(f"- [{outcome_icon}] R{e.get('round')}: {e.get('target_func')} | QPS {qps_delta} | {', '.join(e.get('files_changed', [])[:3])}")
+            if e.get("changes_summary"):
+                lines.append(f"  摘要: {e['changes_summary'][:100]}...")
+        return "\n".join(lines)
 
 
 class KiroApplyAndTestStep(Step):
@@ -177,6 +189,11 @@ class KiroApplyAndTestStep(Step):
         build_cmds = list(self.cfg.get("build_cmds", []))
         test_cmds = list(self.cfg.get("test_cmds", []))
         max_iterations = int(self.cfg.get("max_iterations", 5))
+
+        # recall 检查配置
+        recall_cmd = str(self.cfg.get("recall_cmd", "")).strip()
+        recall_regex = re.compile(str(self.cfg.get("recall_regex", r"recall.*:\s*([0-9.]+)")), re.IGNORECASE)
+        min_recall = float(self.cfg.get("min_recall", ctx.workflow_cfg.get("initial_recall", 0.85)))
 
         # 首次使用 codex 生成的 prompt 文件
         prompt_file = ctx.data.get("kiro_prompt_file")
@@ -215,13 +232,29 @@ class KiroApplyAndTestStep(Step):
                         test_ok = False
                         break
 
-            if test_ok:
+            # recall 检查
+            recall_ok, recall_log = True, None
+            if test_ok and recall_cmd:
+                recall_log = ctx.logger.path(f"05_recall_iter_{i}.log")
+                r = run_shell(command=recall_cmd, cwd=ctx.repo_root, env=None, log_path=recall_log, tee=True)
+                ctx.logger.append_command(recall_cmd, r.returncode, recall_log)
+                if r.returncode != 0:
+                    recall_ok = False
+                else:
+                    recall_val = None
+                    for m in recall_regex.finditer(r.output_text):
+                        recall_val = float(m.group(1))
+                    if recall_val is not None and recall_val < min_recall:
+                        recall_ok = False
+                        ctx.logger.write_text(f"05_recall_iter_{i}_fail.txt", f"recall={recall_val} < min={min_recall}\n")
+
+            if test_ok and recall_ok:
                 ctx.data["tests_passed"] = True
                 ctx.logger.write_text("05_test_status.txt", f"PASS after iteration {i}\n")
                 return
 
             # 失败时生成 retry prompt 文件
-            last_log = test_logs[-1] if test_logs else build_logs[-1] if build_logs else kiro_log
+            last_log = recall_log if (recall_log and not recall_ok) else test_logs[-1] if test_logs else build_logs[-1] if build_logs else kiro_log
             err_tail = last_log.read_text(encoding="utf-8", errors="ignore").splitlines()[-120:]
             retry_content = retry_prompt_template.format(error_log="\n".join(err_tail))
             prompt_path = ctx.logger.path(f"05_kiro_retry_{i}.md")
@@ -338,8 +371,39 @@ class CodexGitDecideStep(Step):
             ctx.state["last_benchmark_summary"] = cur
         # 保存 decision 供下一轮参考
         decision_path = ctx.logger.path("07_decision.md")
-        if decision_path.exists():
-            ctx.state["last_decision"] = decision_path.read_text(encoding="utf-8")
+        decision_text = decision_path.read_text(encoding="utf-8") if decision_path.exists() else ""
+        if decision_text:
+            ctx.state["last_decision"] = decision_text
+
+        # 追加 changelog 条目
+        self._append_changelog(ctx, cur, prev, diff_stat, decision_text)
+
+    def _append_changelog(self, ctx: WorkflowContext, cur: dict | None, prev: dict | None, diff_stat: str, decision: str) -> None:
+        from datetime import datetime
+        changelog = ctx.state.setdefault("changelog", [])
+        # 读取 changes_summary（kiro 生成的修改摘要）
+        summary_path = ctx.logger.path("05_changes_summary.md")
+        changes_summary = summary_path.read_text(encoding="utf-8").strip() if summary_path.exists() else ""
+        # 解析 decision 中的 outcome（commit/checkout）
+        outcome = "checkout"
+        if decision:
+            if "commit" in decision.lower() and "不 commit" not in decision and "不commit" not in decision:
+                outcome = "commit"
+        # 提取修改的文件列表
+        files_changed = [line.split("|")[0].strip() for line in diff_stat.splitlines() if "|" in line]
+        # 构建 changelog 条目
+        entry = {
+            "round": ctx.round_idx,
+            "run_id": ctx.run_id,
+            "timestamp": datetime.now().isoformat(),
+            "target_func": ctx.data.get("targets", [{}])[0].get("function", ""),
+            "files_changed": files_changed,
+            "changes_summary": changes_summary,
+            "qps_before": prev.get("qps", {}).get("mean") if prev else None,
+            "qps_after": cur.get("qps", {}).get("mean") if cur else None,
+            "outcome": outcome,
+        }
+        changelog.append(entry)
 
 
 # Step 注册表

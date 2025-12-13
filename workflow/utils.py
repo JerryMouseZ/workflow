@@ -189,19 +189,36 @@ def rg_matches(repo_root: Path, roots: list[str], needle: str, max_total: int) -
     matches: list[dict[str, Any]] = []
     rg = which("rg")
     if rg:
-        pattern = rf"\\b{re.escape(needle)}\\b"
-        cmd = ["rg", "-n", "-S", "--no-heading", "--glob", "!.git/**", pattern] + roots
-        proc = subprocess.run(cmd, cwd=str(repo_root), text=True, capture_output=True)
-        for line in proc.stdout.splitlines():
-            parts = line.split(":", 2)
-            if len(parts) != 3:
-                continue
-            try:
-                matches.append({"path": parts[0], "line": int(parts[1]), "content": parts[2]})
-            except ValueError:
-                continue
-            if len(matches) >= max_total:
-                break
+        existing_roots = [r for r in roots if (repo_root / r).exists()]
+        search_roots = existing_roots or ["."]
+
+        def _parse_rg_stdout(stdout: str) -> list[dict[str, Any]]:
+            out: list[dict[str, Any]] = []
+            for line in stdout.splitlines():
+                parts = line.split(":", 2)
+                if len(parts) != 3:
+                    continue
+                try:
+                    out.append({"path": parts[0], "line": int(parts[1]), "content": parts[2]})
+                except ValueError:
+                    continue
+                if len(out) >= max_total:
+                    break
+            return out
+
+        # 优先：对 C/C++ 标识符用单词边界精确匹配；否则退化为固定字符串搜索。
+        is_identifier = re.fullmatch(r"[A-Za-z_]\w*", needle) is not None
+        if is_identifier:
+            pattern = rf"\b{re.escape(needle)}\b"
+            cmd = ["rg", "-n", "-S", "--no-heading", "--glob", "!.git/**", pattern] + search_roots
+            proc = subprocess.run(cmd, cwd=str(repo_root), text=True, capture_output=True)
+            matches = _parse_rg_stdout(proc.stdout)
+
+        if not matches:
+            cmd = ["rg", "-n", "-S", "--no-heading", "--glob", "!.git/**", "-F", needle] + search_roots
+            proc = subprocess.run(cmd, cwd=str(repo_root), text=True, capture_output=True)
+            matches = _parse_rg_stdout(proc.stdout)
+
         return matches
 
     # fallback: 纯 Python 搜索
@@ -253,20 +270,18 @@ def collect_context_md(
     *, repo_root: Path, target_func: str, roots: list[str],
     snippet_radius: int, max_files: int, max_total_matches: int,
 ) -> tuple[str, list[dict[str, Any]]]:
-    """收集目标函数的上下文信息，生成 Markdown"""
+    """收集目标函数的上下文信息，生成精简 Markdown（只保留调用链和关键代码）"""
     matches = rg_matches(repo_root, roots, target_func, max_total_matches)
+    if not matches:
+        return f"# Context for `{target_func}`\n\n_No matches found._\n", matches
+
     by_file: dict[str, list[dict[str, Any]]] = {}
     for m in matches:
         by_file.setdefault(m["path"], []).append(m)
     ranked_files = sorted(by_file.items(), key=lambda kv: -len(kv[1]))[:max_files]
 
-    callers: dict[str, int] = {}
-    md_lines = [f"# Context for `{target_func}`", "", "## Candidate files"]
-    for p, ms in ranked_files:
-        md_lines.append(f"- `{p}` (matches={len(ms)})")
-    md_lines.append("")
-
-    md_lines.append("## Call-site hints (heuristic)")
+    # 收集调用链信息
+    callers: dict[str, list[tuple[str, int]]] = {}  # caller -> [(file, line), ...]
     for p, ms in ranked_files:
         try:
             file_lines = (repo_root / p).read_text(encoding="utf-8", errors="ignore").splitlines()
@@ -274,18 +289,29 @@ def collect_context_md(
             continue
         for m in ms[:10]:
             caller = enclosing_c_function(file_lines, int(m["line"]))
-            if caller:
-                callers[caller] = callers.get(caller, 0) + 1
-    for caller, cnt in sorted(callers.items(), key=lambda kv: -kv[1])[:20]:
-        md_lines.append(f"- `{caller} -> {target_func}` (hits={cnt})")
+            if caller and caller != target_func:
+                callers.setdefault(caller, []).append((p, int(m["line"])))
+
+    md_lines = [f"# Context for `{target_func}`", ""]
+
+    # 调用链（最重要）
+    md_lines.append("## Call chain")
+    if callers:
+        for caller, locs in sorted(callers.items(), key=lambda kv: -len(kv[1]))[:10]:
+            loc_str = ", ".join(f"{p}:{ln}" for p, ln in locs[:3])
+            md_lines.append(f"- `{caller}` -> `{target_func}` @ {loc_str}")
+    else:
+        md_lines.append("_(no callers found)_")
     md_lines.append("")
 
-    md_lines.append("## Snippets")
-    for p, ms in ranked_files:
+    # 关键代码片段（精简：每文件最多 2 个，radius 限制为 8 行）
+    effective_radius = min(snippet_radius, 8)
+    md_lines.append("## Key snippets")
+    for p, ms in ranked_files[:7]:  # 最多 7 个文件
         abs_p = repo_root / p
         md_lines.append(f"### `{p}`")
-        for m in ms[:5]:
-            md_lines.extend([f"\n**match @ L{m['line']}**\n", "```", snippet(abs_p, int(m["line"]), snippet_radius), "```"])
+        for m in ms[:2]:  # 每文件最多 2 个片段
+            md_lines.extend([f"L{m['line']}:", "```c", snippet(abs_p, int(m["line"]), effective_radius), "```"])
         md_lines.append("")
 
     return "\n".join(md_lines), matches

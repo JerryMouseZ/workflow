@@ -40,14 +40,15 @@ max_total_matches = 120
 [[steps]]
 type = "codex_generate_kiro_prompt"
 name = "codex_plan"
-codex_cmd = ["kiro-cli", "chat", "-a"]
+codex_cmd = ["codex", "exec", "--dangerously-bypass-approvals-and-sandbox"]
 prompt_file = "workflow/prompts/codex_generate_kiro.md"
 max_context_chars = 12000
 
 [[steps]]
 type = "kiro_apply_and_test"
 name = "kiro"
-kiro_cmd = ["kiro-cli", "chat", "-a"]
+kiro_cmd = ["codex", "exec", "--dangerously-bypass-approvals-and-sandbox"]
+# kiro_cmd = ["kiro-cli", "chat", "-a"]
 retry_prompt_file = "workflow/prompts/kiro_retry.md"
 max_iterations = 5
 
@@ -58,6 +59,10 @@ build_cmds = [
 test_cmds = [
   "cd polardb && make -C src/test/regress check -j32",
 ]
+# recall 正确性检查（可选）
+recall_cmd = "cd test && bash run_benchmark.sh --base_file dataset_10M/base.10M.filtered.fbin --query_file dataset_10M/10M.query.10000.fbin --gt_file dataset_10M/10M.groundtruth.10000.ibin --skip_load --skip_index"
+recall_regex = "avg recall@\\d+ of \\d+ queries is: ([0-9.]+)"
+min_recall = 0.85
 
 [[steps]]
 type = "benchmark"
