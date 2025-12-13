@@ -64,7 +64,7 @@ type = "benchmark"
 name = "bench"
 warmup = 3
 runs = 10
-command = "cd test && bash run_benchmark.sh --base_file dataset_10M/base.10M.filtered.fbin --query_file dataset_10M/10M.query.10000.fbin --gt_file dataset_10M/10M.groundtruth.10000.ibin --skip_load --skip_index"
+command = "cd test && bash run_benchmark.sh --base_file dataset_10M/base.10M.filtered.fbin --query_file dataset_10M/10M.query.10000.fbin --gt_file dataset_10M/10M.groundtruth.10000.ibin --skip_load --skip_index --profile"
 qps_regex = ".*QPS is: ([0-9.]+)"
 recall_regex = "avg recall@\\d+ of \\d+ queries is: ([0-9.]+)"
 

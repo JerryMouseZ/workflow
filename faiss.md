@@ -353,6 +353,3 @@ if (counter == 4) {
 5. `search_from_candidates` 进行 best-first 扩展，受 `efSearch` 与早停控制，并用 batch4+prefetch 等优化减少距离与访存成本。
 6. 返回 top-k（必要时对相似度距离翻转）。
 
----
-
-如果你还希望我补充 `DistanceComputer` 在 Flat/PQ/SQ 下的具体实现差异，或结合一组参数（M/efSearch）做复杂度与 recall 的定量推导，我可以继续扩展该文档。 
