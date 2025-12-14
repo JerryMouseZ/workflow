@@ -4,9 +4,9 @@
 rounds = 1
 log_dir = "workflow/logs"
 state_file = "workflow/state.json"
-# 初始基准值：第一轮没有上轮数据时使用
-initial_qps = 3500
-initial_recall = 0.858
+# 初始基准值：当两者都为 0 时，会在工作流开始前自动运行一次 benchmark 初始化
+initial_qps = 0.0
+initial_recall = 0.0
 
 [[steps]]
 type = "profile_analyze"
@@ -21,21 +21,6 @@ ignore_regex = ["^\\[.*\\]$", "(?i)unknown"]
 # type = "command"
 # name = "generate_profile"
 # command = "bash test/run_benchmark.sh --restore_index_backup --profile"
-
-[[steps]]
-type = "target_select"
-name = "target"
-# top_self_percent | top_samples
-strategy = "top_self_percent"
-pick_top_k = 3
-
-[[steps]]
-type = "context_collect"
-name = "context"
-search_roots = ["polardb"]
-max_files = 20
-snippet_radius = 50
-max_total_matches = 120
 
 [[steps]]
 type = "codex_generate_kiro_prompt"
@@ -69,7 +54,7 @@ type = "benchmark"
 name = "bench"
 warmup = 3
 runs = 10
-command = "cd test && bash run_benchmark.sh --base_file dataset_10M/base.10M.filtered.fbin --query_file dataset_10M/10M.query.10000.fbin --gt_file dataset_10M/10M.groundtruth.10000.ibin --skip_load --skip_index --profile"
+command = "cd test && bash run_benchmark.sh --base_file dataset_10M/base.10M.filtered.fbin --query_file dataset_10M/10M.query.10000.fbin --gt_file dataset_10M/10M.groundtruth.10000.ibin --skip_load --skip_index"
 qps_regex = ".*QPS is: ([0-9.]+)"
 recall_regex = "avg recall@\\d+ of \\d+ queries is: ([0-9.]+)"
 
@@ -81,3 +66,5 @@ prompt_file = "workflow/prompts/codex_git_decide.md"
 summarize_prompt_file = "workflow/prompts/codex_summarize.md"
 # codex | local（local=由本脚本执行git，codex只给出总结）
 mode = "local"
+# commit 成功后运行 profile 生成命令
+profile_cmd = "cd test && bash run_benchmark.sh --base_file dataset_10M/base.10M.filtered.fbin --query_file dataset_10M/10M.query.10000.fbin --gt_file dataset_10M/10M.groundtruth.10000.ibin --skip_load --skip_index --profile"

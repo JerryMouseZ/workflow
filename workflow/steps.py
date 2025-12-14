@@ -8,7 +8,8 @@ from typing import TYPE_CHECKING, Any
 
 from .utils import (
     collect_context_md, filter_profile_entries, git, json_dump, latest_folded_file,
-    parse_self_time_table, pick_targets, run_agent, run_agent_file, run_cmd, run_shell, which,
+    load_changelog, parse_self_time_table, pick_targets, run_agent, run_agent_file,
+    run_cmd, run_shell, save_changelog, which,
 )
 
 if TYPE_CHECKING:
@@ -77,7 +78,10 @@ class TargetSelectStep(Step):
         filtered = ctx.data.get("profile", {}).get("filtered") or []
         strategy = str(self.cfg.get("strategy", "top_self_percent"))
         pick_top_k = int(self.cfg.get("pick_top_k", 3))
-        targets = pick_targets(filtered, strategy=strategy, k=pick_top_k)
+        max_attempts = int(self.cfg.get("max_attempts_per_func", 3))
+        changelog = load_changelog(ctx.state_file)
+        targets = pick_targets(filtered, strategy=strategy, k=pick_top_k, 
+                               changelog=changelog, max_attempts_per_func=max_attempts)
         if not targets:
             raise RuntimeError("no target functions after filtering")
         ctx.data["targets"] = targets
@@ -125,15 +129,19 @@ class CodexGenerateKiroPromptStep(Step):
         prompt_template = prompt_path.read_text(encoding="utf-8")
 
         max_context_chars = int(self.cfg.get("max_context_chars", 12000))
-        targets = ctx.data["targets"]
-        profile_filtered = ctx.data["profile"]["filtered"][:20]
-        context_md = ctx.logger.path(ctx.data["context"]["md_path"]).read_text(encoding="utf-8")[:max_context_chars]
+        profile_filtered = ctx.data.get("profile", {}).get("filtered", [])[:20]
+        targets = ctx.data.get("targets") or profile_filtered[:3]
+        context_data = ctx.data.get("context", {})
+        if context_data.get("md_path"):
+            context_md = ctx.logger.path(context_data["md_path"]).read_text(encoding="utf-8")[:max_context_chars]
+        else:
+            context_md = "(no context collected)"
 
         # codex 将 kiro prompt 写入此文件
         kiro_prompt_path = ctx.logger.path("04_kiro_prompt.md")
 
         # 格式化历史 changelog
-        changelog_text = self._format_changelog(ctx.state.get("changelog", []))
+        changelog_text = self._format_changelog(load_changelog(ctx.state_file))
 
         codex_prompt = prompt_template.format(
             target_lines="\n".join([f"- {t['function']} (self%={t['self_pct']}, samples={t['samples']})" for t in targets]),
@@ -331,12 +339,13 @@ class CodexGitDecideStep(Step):
             raise RuntimeError(f"codex not found in PATH: {codex_cmd[0]}")
 
         mode = str(self.cfg.get("mode", "codex"))
-        prev, cur = ctx.state.get("last_benchmark_summary"), ctx.data.get("benchmark_summary")
-        # 如果没有上轮数据，使用配置的初始基准值
-        if not prev:
+        # 使用历史最佳作为比较基准（而非上一轮，因为上一轮可能被回滚）
+        best, cur = ctx.state.get("best_benchmark_summary"), ctx.data.get("benchmark_summary")
+        # 如果没有历史最佳数据，使用配置的初始基准值
+        if not best:
             init_qps = ctx.workflow_cfg.get("initial_qps", 0.0)
             init_recall = ctx.workflow_cfg.get("initial_recall", 0.85)
-            prev = {"qps": {"mean": init_qps}, "recall": {"mean": init_recall}, "_initial": True}
+            best = {"qps": {"mean": init_qps}, "recall": {"mean": init_recall}, "_initial": True}
         head = git("git rev-parse HEAD", ctx.repo_root)
         diff_stat = git("git diff --stat", ctx.repo_root)
         status = git("git status --porcelain", ctx.repo_root)
@@ -353,7 +362,7 @@ class CodexGitDecideStep(Step):
 
         if mode == "local":
             codex_prompt = prompt_template.format(
-                prev_summary=json.dumps(prev, ensure_ascii=False, indent=2) if prev else "null",
+                best_summary=json.dumps(best, ensure_ascii=False, indent=2) if best else "null",
                 cur_summary=json.dumps(cur, ensure_ascii=False, indent=2) if cur else "null",
                 diff_stat=diff_stat or "(no diff)",
                 run_dir=ctx.logger.run_dir,
@@ -361,7 +370,7 @@ class CodexGitDecideStep(Step):
         else:
             codex_prompt = prompt_template.format(
                 head=head,
-                prev_summary=json.dumps(prev, ensure_ascii=False, indent=2) if prev else "null",
+                best_summary=json.dumps(best, ensure_ascii=False, indent=2) if best else "null",
                 cur_summary=json.dumps(cur, ensure_ascii=False, indent=2) if cur else "null",
                 diff_stat=diff_stat or "(no diff)",
                 status=status or "(clean)",
@@ -379,13 +388,16 @@ class CodexGitDecideStep(Step):
 
         # local 模式：python 执行 git 决策
         if mode == "local":
-            outcome = self._decide_and_execute_git(ctx, prev, cur, diff_stat, status)
+            outcome = self._decide_and_execute_git(ctx, best, cur, diff_stat, status)
         else:
             outcome = None
 
         ctx.state["last_git_head"] = git("git rev-parse HEAD", ctx.repo_root)
-        if cur:
-            ctx.state["last_benchmark_summary"] = cur
+        # 只有 commit 时才更新历史最佳
+        if cur and outcome == "commit":
+            ctx.state["best_benchmark_summary"] = cur
+            # commit 成功后运行 profile 生成命令
+            self._run_profile_after_commit(ctx)
         # 保存 decision 供下一轮参考
         decision_path = ctx.logger.path("07_decision.md")
         decision_text = decision_path.read_text(encoding="utf-8") if decision_path.exists() else ""
@@ -393,26 +405,36 @@ class CodexGitDecideStep(Step):
             ctx.state["last_decision"] = decision_text
 
         # 追加 changelog 条目
-        self._append_changelog(ctx, cur, prev, diff_stat, decision_text, outcome)
+        self._append_changelog(ctx, cur, best, diff_stat, decision_text, outcome)
 
-    def _decide_and_execute_git(self, ctx: WorkflowContext, prev: dict | None, cur: dict | None, diff_stat: str, status: str) -> str:
+    def _run_profile_after_commit(self, ctx: WorkflowContext) -> None:
+        """commit 成功后运行 profile 生成命令"""
+        profile_cmd = self.cfg.get("profile_cmd")
+        if not profile_cmd:
+            return
+        cmd = profile_cmd if isinstance(profile_cmd, str) else " ".join(profile_cmd)
+        lp = ctx.logger.path("07_profile_after_commit.log")
+        print(f"[profile] running profile after commit: {cmd}")
+        run_shell(command=cmd, cwd=ctx.repo_root, env=None, log_path=lp, tee=True)
+
+    def _decide_and_execute_git(self, ctx: WorkflowContext, best: dict | None, cur: dict | None, diff_stat: str, status: str) -> str:
         """根据 benchmark 结果决定 commit 或 checkout，返回 outcome"""
         min_recall = float(self.cfg.get("min_recall", 0.85))
-        cur_qps = cur.get("qps", {}).get("mean") if cur else None
+        cur_qps = cur.get("qps", {}).get("median") if cur else None
         cur_recall = cur.get("recall", {}).get("mean") if cur else None
-        prev_qps = prev.get("qps", {}).get("mean") if prev else None
+        best_qps = best.get("qps", {}).get("median") if best else None
 
-        # 决策逻辑：recall >= min_recall 且 qps 有提升则 commit
+        # 决策逻辑：recall >= min_recall 且 qps 超过历史最佳则 commit
         should_commit = (
             cur_qps is not None and cur_recall is not None and
             cur_recall >= min_recall and
-            (prev_qps is None or cur_qps >= prev_qps)
+            (best_qps is None or cur_qps >= best_qps)
         )
 
         if should_commit and status.strip():
             # 执行 commit
             git("git add -A", ctx.repo_root)
-            msg = f"perf: QPS {prev_qps:.1f} -> {cur_qps:.1f}, recall {cur_recall:.3f}"
+            msg = f"perf: QPS median {best_qps:.1f} -> {cur_qps:.1f}, recall {cur_recall:.3f}"
             git(f'git commit -m "{msg}"', ctx.repo_root)
             ctx.logger.write_text("07_git_action.txt", f"COMMIT: {msg}\n")
             return "commit"
@@ -427,7 +449,7 @@ class CodexGitDecideStep(Step):
 
     def _append_changelog(self, ctx: WorkflowContext, cur: dict | None, prev: dict | None, diff_stat: str, decision: str, outcome: str | None = None) -> None:
         from datetime import datetime
-        changelog = ctx.state.setdefault("changelog", [])
+        changelog = load_changelog(ctx.state_file)
         # 读取 changes_summary（kiro 生成的修改摘要）
         summary_path = ctx.logger.path("05_changes_summary.md")
         changes_summary = summary_path.read_text(encoding="utf-8").strip() if summary_path.exists() else ""
@@ -452,6 +474,7 @@ class CodexGitDecideStep(Step):
             "outcome": outcome,
         }
         changelog.append(entry)
+        save_changelog(ctx.state_file, changelog)
 
 
 # Step 注册表

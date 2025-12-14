@@ -4,6 +4,9 @@
 rounds = 1
 log_dir = "workflow/logs"
 state_file = "workflow/state.json"
+# 初始基准值：当两者都为 0 时，会在工作流开始前自动运行一次 benchmark 初始化
+initial_qps = 0.0
+initial_recall = 0.0
 
 [[steps]]
 type = "profile_analyze"
@@ -73,3 +76,5 @@ codex_cmd = ["codex", "exec", "--dangerously-bypass-approvals-and-sandbox"]
 prompt_file = "workflow/prompts/codex_git_decide.md"
 # codex | local（local=由本脚本执行git，codex只给出结构化决策）
 mode = "codex"
+# commit 成功后运行 profile 生成命令（可选）
+profile_cmd = "cd test && bash run_benchmark.sh --restore_index_backup --profile"

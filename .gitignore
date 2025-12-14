@@ -1,4 +1,5 @@
 logs/
 state.json
+changelog.json
 __pycache__
 

@@ -112,6 +112,9 @@ class WorkflowRunner:
             except Exception:
                 state = {}
 
+        # 当 initial_qps 和 initial_recall 都为 0 且没有历史 benchmark 数据时，先运行一次 benchmark 初始化
+        self._maybe_run_initial_benchmark(state, state_file, log_dir)
+
         last_completed_idx = state.get("last_completed_step_idx", 0) if self.resume else 0
         persisted_data = state.get("data", {}) if self.resume else {}
 
@@ -197,3 +200,30 @@ class WorkflowRunner:
                 continue
             return False
         return True
+
+    def _maybe_run_initial_benchmark(self, state: dict[str, Any], state_file: Path, log_dir: Path) -> None:
+        """当 initial_qps 和 initial_recall 都为 0 且没有历史 benchmark 数据时，运行一次 benchmark 初始化"""
+        init_qps = float(self.workflow_cfg.get("initial_qps", 0.0))
+        init_recall = float(self.workflow_cfg.get("initial_recall", 0.0))
+        if init_qps != 0.0 or init_recall != 0.0 or state.get("best_benchmark_summary"):
+            return
+
+        # 找到 benchmark step 配置
+        bench_cfg = next((s for s in self.steps_cfg if s.get("type") == "benchmark"), None)
+        if not bench_cfg:
+            return
+
+        print("[init] initial_qps=0 and initial_recall=0, running initial benchmark...")
+        run_id = f"{now_id()}_init"
+        logger = RunLogger(log_dir / run_id)
+        ctx = WorkflowContext(
+            repo_root=self.repo_root, run_id=run_id, round_idx=0,
+            logger=logger, state_file=state_file, state=state,
+            workflow_cfg=self.workflow_cfg, data={},
+        )
+        STEP_REGISTRY["benchmark"](bench_cfg).run(ctx)
+        summary = ctx.data.get("benchmark_summary")
+        if summary:
+            state["best_benchmark_summary"] = summary
+            json_dump(state_file, state)
+            print(f"[init] initial benchmark done: QPS={summary.get('qps', {}).get('median')}, recall={summary.get('recall', {}).get('mean')}")

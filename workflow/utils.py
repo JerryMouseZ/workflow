@@ -47,6 +47,23 @@ def json_dump(path: Path, obj: Any) -> None:
     path.write_text(json.dumps(obj, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
+def load_changelog(state_file: Path) -> list[dict[str, Any]]:
+    """从独立文件加载 changelog"""
+    changelog_file = state_file.parent / "changelog.json"
+    if changelog_file.exists():
+        try:
+            return json.loads(changelog_file.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return []
+
+
+def save_changelog(state_file: Path, changelog: list[dict[str, Any]]) -> None:
+    """保存 changelog 到独立文件"""
+    changelog_file = state_file.parent / "changelog.json"
+    json_dump(changelog_file, changelog)
+
+
 @dataclass
 class CmdResult:
     returncode: int
@@ -178,13 +195,29 @@ def filter_profile_entries(entries: list[dict[str, Any]], ignore_regex: list[str
     return [e for e in entries if not any(r.search(str(e["function"])) for r in regs)]
 
 
-def pick_targets(entries: list[dict[str, Any]], strategy: str, k: int) -> list[dict[str, Any]]:
+def pick_targets(entries: list[dict[str, Any]], strategy: str, k: int, 
+                 changelog: list[dict] | None = None, max_attempts_per_func: int = 3) -> list[dict[str, Any]]:
+    """选择优化目标，避免重复优化同一函数太多次"""
     if not entries:
         return []
+    
+    # 统计每个函数被尝试的次数（只计算 checkout 的，commit 的说明有效）
+    attempt_counts: dict[str, int] = {}
+    if changelog:
+        for entry in changelog:
+            func = entry.get("target_func", "")
+            if entry.get("outcome") == "checkout":
+                attempt_counts[func] = attempt_counts.get(func, 0) + 1
+    
+    # 过滤掉尝试次数过多的函数
+    filtered = [e for e in entries if attempt_counts.get(e["function"], 0) < max_attempts_per_func]
+    if not filtered:
+        filtered = entries  # 如果全部被过滤，回退到原始列表
+    
     if strategy == "top_samples":
-        ranked = sorted(entries, key=lambda x: (-int(x["samples"]), float(x["self_pct"])))
+        ranked = sorted(filtered, key=lambda x: (-int(x["samples"]), float(x["self_pct"])))
     else:
-        ranked = sorted(entries, key=lambda x: (-float(x["self_pct"]), -int(x["samples"])))
+        ranked = sorted(filtered, key=lambda x: (-float(x["self_pct"]), -int(x["samples"])))
     return ranked[:max(1, k)]
 
 
