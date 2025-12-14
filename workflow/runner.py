@@ -19,6 +19,7 @@ class WorkflowContext:
     logger: RunLogger
     state_file: Path
     state: dict[str, Any]
+    config: dict[str, Any] = field(default_factory=dict)
     workflow_cfg: dict[str, Any] = field(default_factory=dict)
     data: dict[str, Any] = field(default_factory=dict)
 
@@ -131,7 +132,7 @@ class WorkflowRunner:
             ctx = WorkflowContext(
                 repo_root=self.repo_root, run_id=run_id, round_idx=round_idx,
                 logger=logger, state_file=state_file, state=state,
-                workflow_cfg=self.workflow_cfg, data=dict(persisted_data),
+                config=self.config, workflow_cfg=self.workflow_cfg, data=dict(persisted_data),
             )
 
             step_plan = self._build_step_plan(last_completed_idx)
@@ -219,7 +220,7 @@ class WorkflowRunner:
         ctx = WorkflowContext(
             repo_root=self.repo_root, run_id=run_id, round_idx=0,
             logger=logger, state_file=state_file, state=state,
-            workflow_cfg=self.workflow_cfg, data={},
+            config=self.config, workflow_cfg=self.workflow_cfg, data={},
         )
         STEP_REGISTRY["benchmark"](bench_cfg).run(ctx)
         summary = ctx.data.get("benchmark_summary")
