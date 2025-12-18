@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .steps import STEP_REGISTRY
+from .steps import STEP_REGISTRY  # 从 steps/ 子包导入
 from .utils import RunLogger, git, json_dump, latest_run_id, now_id
 
 
