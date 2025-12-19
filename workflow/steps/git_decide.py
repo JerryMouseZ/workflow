@@ -23,11 +23,18 @@ class CodexGitDecideStep(Step):
             raise RuntimeError(f"codex not found in PATH: {codex_cmd[0]}")
 
         mode = str(self.cfg.get("mode", "codex"))
-        best, cur = ctx.state.get("best_benchmark_summary"), ctx.data.get("benchmark_summary")
+        best = ctx.state.get("best_benchmark_summary")
+        cur = ctx.data.get("benchmark_summary") or ctx.state.get("last_benchmark_summary")
         if not best:
             init_qps = ctx.workflow_cfg.get("initial_qps", 0.0)
             init_recall = ctx.workflow_cfg.get("initial_recall", 0.85)
-            best = {"qps": {"mean": init_qps}, "recall": {"mean": init_recall}, "_initial": True}
+            init_index_time = ctx.workflow_cfg.get("initial_index_build_time_s")
+            best = {
+                "qps": {"mean": init_qps},
+                "recall": {"mean": init_recall},
+                "index_build_time_s": {"mean": init_index_time} if init_index_time is not None else {"mean": None},
+                "_initial": True,
+            }
 
         head = git("git rev-parse HEAD", ctx.repo_root)
         diff_stat = git("git diff --stat", ctx.repo_root)
@@ -99,23 +106,50 @@ class CodexGitDecideStep(Step):
         min_recall = float(self.cfg.get("min_recall", 0.85))
         cur_qps = cur.get("qps", {}).get("median") if cur else None
         cur_recall = cur.get("recall", {}).get("mean") if cur else None
+        cur_index_time = cur.get("index_build_time_s", {}).get("median") if cur else None
+
         best_qps = best.get("qps", {}).get("median") if best else None
+        best_index_time = best.get("index_build_time_s", {}).get("median") if best else None
+
+        def _perf_better_or_equal() -> bool:
+            # Priority: index build time (smaller is better) > query QPS (larger is better)
+            if isinstance(cur_index_time, (int, float)) and isinstance(best_index_time, (int, float)):
+                if cur_index_time < best_index_time:
+                    return True
+                if cur_index_time > best_index_time:
+                    return False
+                # tie -> compare QPS
+
+            if cur_qps is None:
+                return False
+            if best_qps is None:
+                return True
+            return cur_qps >= best_qps
 
         should_commit = (
-            cur_qps is not None and cur_recall is not None and
+            cur_recall is not None and
             cur_recall >= min_recall and
-            (best_qps is None or cur_qps >= best_qps)
+            _perf_better_or_equal()
         )
 
         if should_commit and status.strip():
             git("git add -A", ctx.repo_root)
-            msg = f"perf: QPS median {best_qps:.1f} -> {cur_qps:.1f}, recall {cur_recall:.3f}"
+            parts: list[str] = []
+            if isinstance(best_index_time, (int, float)) and isinstance(cur_index_time, (int, float)):
+                parts.append(f"index_build_time {best_index_time:.3f}s -> {cur_index_time:.3f}s")
+            if isinstance(best_qps, (int, float)) and isinstance(cur_qps, (int, float)):
+                parts.append(f"QPS median {best_qps:.1f} -> {cur_qps:.1f}")
+            parts.append(f"recall {cur_recall:.3f}")
+            msg = "perf: " + ", ".join(parts)
             git(f'git commit -m "{msg}"', ctx.repo_root)
             ctx.logger.write_text("07_git_action.txt", f"COMMIT: {msg}\n")
             return "commit"
         elif status.strip():
             git("git checkout -- .", ctx.repo_root)
-            ctx.logger.write_text("07_git_action.txt", f"CHECKOUT: QPS {cur_qps}, recall {cur_recall}\n")
+            ctx.logger.write_text(
+                "07_git_action.txt",
+                f"CHECKOUT: index_build_time={cur_index_time}, QPS={cur_qps}, recall={cur_recall}\n",
+            )
             return "checkout"
         else:
             ctx.logger.write_text("07_git_action.txt", "NO_CHANGE: working tree clean\n")
@@ -143,6 +177,10 @@ class CodexGitDecideStep(Step):
             "changes_summary": changes_summary,
             "qps_before": prev.get("qps", {}).get("mean") if prev else None,
             "qps_after": cur.get("qps", {}).get("mean") if cur else None,
+            "recall_before": prev.get("recall", {}).get("mean") if prev else None,
+            "recall_after": cur.get("recall", {}).get("mean") if cur else None,
+            "index_build_time_s_before": prev.get("index_build_time_s", {}).get("mean") if prev else None,
+            "index_build_time_s_after": cur.get("index_build_time_s", {}).get("mean") if cur else None,
             "outcome": outcome,
         }
         changelog.append(entry)

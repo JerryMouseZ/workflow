@@ -28,11 +28,13 @@ def _get_registry() -> dict[str, type[Step]]:
     from .kiro import KiroApplyAndTestStep
     from .benchmark import BenchmarkStep
     from .git_decide import CodexGitDecideStep
+    from .codex_analyze_optimize import CodexAnalyzeAndOptimizeStep
 
     return {
         cls.type_name: cls for cls in [
             CommandStep, ProfileAnalyzeStep, TargetSelectStep, ContextCollectStep,
             CodexGenerateKiroPromptStep, KiroApplyAndTestStep, BenchmarkStep, CodexGitDecideStep,
+            CodexAnalyzeAndOptimizeStep,
         ]
     }
 

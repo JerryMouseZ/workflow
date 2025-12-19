@@ -11,7 +11,7 @@ git diff --stat:
 {diff_stat}
 
 要求：
-1) 分析本轮优化的效果（QPS/recall 变化）
+1) 分析本轮优化的效果（Index build time/QPS/recall 变化；Index build time 更优先）
 2) 归因判断：本轮修改是否超过历史最佳
 3) 给出下一轮演化方向建议（简短但具体）
 

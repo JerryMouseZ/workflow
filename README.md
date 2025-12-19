@@ -58,7 +58,7 @@ python3 workflow/run.py --config workflow/config.toml --resume
 - Profile 分析：强制调用 `python3 test/analyze_self_time.py`，并在工作流侧对结果进行过滤（默认跳过 `^\[.*\]$` / `unknown` 之类的“未知项”）。
 - Orchestrator：根据 profile Top 列表选择候选热点函数，结合 `rg` 搜索得到的调用点/代码片段，调用 `codex exec --dangerously-bypass-approvals-and-sandbox` 产出给 `kiro-cli` 的执行 prompt。
 - Kiro 迭代：执行修改后自动跑编译/单测命令；失败则携带错误日志继续喂给 kiro 迭代，直到通过或达到最大迭代次数。
-- Benchmark：先 warmup 3 次（丢弃），再跑 10 次并解析/保存结果（QPS/Recall 等由正则可配置）。
+- Benchmark：先 warmup 3 次（丢弃），再跑 10 次并解析/保存结果（QPS/Recall/Index build time 等由正则可配置；Index build time 日志格式：`Index build time: 42.5s`）。
 - Git 决策：由 codex 结合“本轮 vs 上轮”的 benchmark 汇总与 `git diff --stat` 归因，决定是否提交或回退；无论 commit/checkout 都会保留本轮 `workflow/logs/<run_id>/` 日志。
 
 ## Agent 调用格式（等价）

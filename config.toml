@@ -5,58 +5,42 @@ rounds = 1
 log_dir = "workflow/logs"
 state_file = "workflow/state.json"
 # 初始基准值：当两者都为 0 时，会在工作流开始前自动运行一次 benchmark 初始化
-initial_qps = 0.0
+initial_qps = 5338.2
 initial_recall = 0.0
+# 可选：若无法运行初始化 benchmark，可手动填写索引构建耗时（单位：秒）
+initial_index_build_time_s = 480.0
+
+# 注意：profile_analyze, target_select, context_collect 步骤已移除
+# 性能分析由 AI skill (perf-profiler) 在 codex_analyze_optimize 步骤中完成
 
 [[steps]]
-type = "profile_analyze"
-name = "profile"
-analyze_cmd = ["python3", "test/analyze_self_time.py"]
-# “unknown/缺失栈”等默认跳过：可按需追加
-ignore_regex = ["^\\[.*\\]$", "(?i)unknown"]
-
-# 你也可以在 profile_analyze 前插入任意脚本（可插拔）
-# 例如：先跑一次带 profile 的 benchmark 生成最新 .folded
-# [[steps]]
-# type = "command"
-# name = "generate_profile"
-# command = "bash test/run_benchmark.sh --restore_index_backup --profile"
-
-[[steps]]
-type = "codex_generate_kiro_prompt"
-name = "codex_plan"
+type = "codex_analyze_and_optimize"
+name = "analyze_optimize"
 codex_cmd = ["codex", "exec", "--dangerously-bypass-approvals-and-sandbox"]
-prompt_file = "workflow/prompts/codex_generate_kiro.md"
-max_context_chars = 12000
-
-[[steps]]
-type = "kiro_apply_and_test"
-name = "kiro"
-kiro_cmd = ["codex", "exec", "--dangerously-bypass-approvals-and-sandbox"]
-# kiro_cmd = ["kiro-cli", "chat", "-a"]
-retry_prompt_file = "workflow/prompts/kiro_retry.md"
+prompt_file = "workflow/prompts/codex_analyze_and_optimize.md"
 max_iterations = 5
 
 # 下面两类命令都通过 bash -lc 执行；请按你的环境/容器实际可用命令调整
 build_cmds = [
-  "cd polardb && make install-world-bin -j32 && ~/tmp_polardb_pg_15_base/bin/pg_ctl stop -D ~/tmp_polardb_pg_15_primary",
+  "cd polardb && make install-world-bin -j32",
 ]
 test_cmds = [
   "cd polardb && make -C src/test/regress check -j32",
 ]
-# recall 正确性检查（可选）
-recall_cmd = "cd test && bash run_benchmark.sh --base_file dataset_10M/base.10M.filtered.fbin --query_file dataset_10M/10M.query.10000.fbin --gt_file dataset_10M/10M.groundtruth.10000.ibin --skip_load --skip_index"
-recall_regex = "avg recall@\\d+ of \\d+ queries is: ([0-9.]+)"
-min_recall = 0.85
+# # recall 正确性检查（可选）
+# recall_cmd = "~/tmp_polardb_pg_15_base/bin/pg_ctl stop -D ~/tmp_polardb_pg_15_primary && cd test && bash run_benchmark.sh --base_file dataset_10M/base.10M.filtered.fbin --query_file dataset_10M/10M.query.10000.fbin --gt_file dataset_10M/10M.groundtruth.10000.ibin"
+# recall_regex = "avg recall@\\d+ of \\d+ queries is: ([0-9.]+)"
+# min_recall = 0.85
 
 [[steps]]
 type = "benchmark"
 name = "bench"
-warmup = 3
-runs = 10
-command = "cd test && bash run_benchmark.sh --base_file dataset_10M/base.10M.filtered.fbin --query_file dataset_10M/10M.query.10000.fbin --gt_file dataset_10M/10M.groundtruth.10000.ibin --skip_load --skip_index"
+warmup = 0
+runs = 1
+command = "~/tmp_polardb_pg_15_base/bin/pg_ctl stop -D ~/tmp_polardb_pg_15_primary && cd test && bash run_benchmark.sh --base_file dataset_10M/base.10M.filtered.fbin --query_file dataset_10M/10M.query.10000.fbin --gt_file dataset_10M/10M.groundtruth.10000.ibin --profile_index --profile"
 qps_regex = ".*QPS is: ([0-9.]+)"
 recall_regex = "avg recall@\\d+ of \\d+ queries is: ([0-9.]+)"
+index_build_time_regex = "Index build time:\\s*([0-9.]+)s"
 
 [[steps]]
 type = "codex_git_decide"
@@ -67,4 +51,4 @@ summarize_prompt_file = "workflow/prompts/codex_summarize.md"
 # codex | local（local=由本脚本执行git，codex只给出总结）
 mode = "local"
 # commit 成功后运行 profile 生成命令
-profile_cmd = "cd test && bash run_benchmark.sh --base_file dataset_10M/base.10M.filtered.fbin --query_file dataset_10M/10M.query.10000.fbin --gt_file dataset_10M/10M.groundtruth.10000.ibin --skip_load --skip_index --profile"
+profile_cmd = ""

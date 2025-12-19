@@ -3,6 +3,7 @@
 - 是否执行 git commit（给出合适的 commit message，并确保把相关文件 add 进去）
 - 或者执行 git checkout / reset 回退变更
 - 请确保recall值大于0.85
+- 如果 summary 中包含 `index_build_time_s`（来源日志行 `Index build time: 42.5s`），则 **index build time 的改进优先级高于 QPS**
 无论 commit 还是 checkout，都必须保留本轮日志目录：{run_dir}
 
 当前 HEAD: {head}

@@ -68,7 +68,11 @@ class CodexGenerateKiroPromptStep(Step):
             outcome_icon = "✓" if e.get("outcome") == "commit" else "✗"
             qps_b, qps_a = e.get("qps_before"), e.get("qps_after")
             qps_delta = f"{qps_a - qps_b:+.1f}" if qps_b and qps_a else "N/A"
+            idx_b, idx_a = e.get("index_build_time_s_before"), e.get("index_build_time_s_after")
+            idx_delta = f"{idx_a - idx_b:+.3f}s" if isinstance(idx_b, (int, float)) and isinstance(idx_a, (int, float)) else "N/A"
             lines.append(f"- [{outcome_icon}] R{e.get('round')}: {e.get('target_func')} | QPS {qps_delta} | {', '.join(e.get('files_changed', [])[:3])}")
+            if idx_delta != "N/A":
+                lines.append(f"  IndexBuild {idx_delta}")
             if e.get("changes_summary"):
                 lines.append(f"  摘要: {e['changes_summary'][:100]}...")
         return "\n".join(lines)
